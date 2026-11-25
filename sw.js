@@ -3,7 +3,7 @@
    Pré-cache do "app shell", navegação network-first e
    assets estáticos cache-first.
    ============================================================ */
-const CACHE_NAME = "vozsegura-v2";
+const CACHE_NAME = "vozsegura-v3";
 
 const PRECACHE = [
   "./",
