@@ -10,7 +10,9 @@ estático, separado em HTML, CSS e JavaScript.
 | ------------ | ---------------------------------------------------------------- |
 | `index.html`           | Estrutura semântica da página (cabeçalho, seções, rodapé e modais) |
 | `styles.css`           | Estilos organizados por variáveis, componentes e responsividade    |
-| `script.js`            | Interações, persistência, área restrita e registro do service worker |
+| `script.js`            | Interações, integração Supabase, área restrita e service worker    |
+| `supabase-config.js`   | URL e chave anon do projeto Supabase (preencher)                   |
+| `supabase/schema.sql`  | Tabela `denuncias`, índice e políticas de RLS                      |
 | `manifest.webmanifest` | Metadados de instalação do PWA (nome, cores, ícones)              |
 | `sw.js`                | Service worker: cache offline do "app shell"                       |
 | `icons/`               | Ícones PNG (192, 512, maskable e Apple Touch)                      |
@@ -36,9 +38,56 @@ python3 -m http.server 8000
 - Animações de entrada das seções (respeitando `prefers-reduced-motion`).
 - Modal de denúncia anônima com validação e tela de confirmação.
 - Contatos de emergência clicáveis (`tel:`).
-- Denúncias salvas localmente (`localStorage`) com número de protocolo e data.
-- **Área da Equipe**: acesso restrito por senha para consultar as denúncias.
+- Denúncias enviadas ao **Supabase** com número de protocolo e data.
+- Migração automática das denúncias antigas do `localStorage` para o banco.
+- **Área da Equipe**: login real via Supabase Auth para consultar/excluir denúncias.
 - **PWA**: instalável na tela inicial, funciona offline e avisa quando a conexão cai.
+  Sem rede, a denúncia fica na fila local e é enviada quando a conexão volta.
+
+## Banco de dados (Supabase)
+
+O site funciona sem configuração, no **modo demonstração** (denúncias só no
+`localStorage`). Para gravar no Supabase:
+
+1. Crie um projeto em <https://supabase.com/dashboard/new>.
+2. Abra o **SQL Editor** do projeto e execute todo o conteúdo de
+   `supabase/schema.sql`. Isso cria a tabela `denuncias` com as colunas usadas
+   pelo formulário:
+
+   | Coluna      | Tipo        | Origem no site                          |
+   | ----------- | ----------- | --------------------------------------- |
+   | `id`        | `uuid`      | chave primária gerada pelo banco        |
+   | `protocolo` | `text`      | `VZ-...` gerado no navegador            |
+   | `criado_em` | `timestamptz` | data/hora do envio                    |
+   | `tipo`      | `text`      | campo "Tipo de violência"               |
+   | `descricao` | `text`      | campo "Conte o que aconteceu"           |
+   | `local`     | `text`      | campo "Onde aconteceu?" (pode ser vazio)|
+
+3. Cadastre os membros da equipe em **Authentication → Users → Add user**
+   (ou pelo provider de sua preferência). Eles usarão e-mail + senha na
+   Área da Equipe.
+4. Em **Project Settings → API**, copie a **Project URL** e a chave
+   **anon / publishable** e preencha `supabase-config.js`:
+
+   ```js
+   window.VOZSEGURA_SUPABASE = {
+     url: "https://abcdefgh.supabase.co",
+     anonKey: "eyJhbGciOi...",
+   };
+   ```
+
+5. Recarregue a página. As denúncias já presentes no `localStorage` são
+   enviadas automaticamente uma vez e removidas do dispositivo após o
+   sucesso. Se alguma falhar, permanece na fila e é reenviada ao ficar
+   online.
+
+> **Nunca** coloque a chave `service_role` em `supabase-config.js` nem em
+> qualquer arquivo entregue ao navegador. A chave anon é pública por design;
+> a segurança vem das políticas de RLS do `schema.sql`: visitantes só podem
+> **inserir**, a equipe autenticada pode **ler e excluir**.
+
+A biblioteca `@supabase/supabase-js` é carregada do jsDelivr sob demanda.
+Se o CDN estiver indisponível, o site cai automaticamente para o modo local.
 
 ## PWA (instalação e offline)
 
@@ -64,12 +113,15 @@ python3 -m http.server 8000
 
 ## Área da Equipe (acesso restrito)
 
-O botão **Área da Equipe** existe no cabeçalho e no rodapé. Ao clicar, é exibido um
-modal que pede a senha. Depois de autenticado (a sessão vale até fechar a aba), é
-possível consultar as denúncias registradas **neste mesmo navegador**, excluir
-itens e fazer logout.
+O botão **Área da Equipe** existe no cabeçalho e no rodapé.
 
-### Senha padrão
+- **Com Supabase configurado:** o modal pede **e-mail e senha** de um usuário
+  cadastrado no Supabase Auth. A sessão é mantida pelo próprio Supabase e a
+  listagem/exclusão vem diretamente da tabela `denuncias` (protegida por RLS).
+- **Sem Supabase configurado:** mantém-se o modo demonstração, com a senha
+  local abaixo e consulta apenas das denúncias deste navegador.
+
+### Senha do modo demonstração
 
 ```
 vozsegura2024
@@ -78,7 +130,7 @@ vozsegura2024
 A senha **não** aparece em texto puro no código: `script.js` guarda apenas o hash
 SHA-256 dela na constante `ACCESS_HASH`.
 
-### Como trocar a senha
+### Como trocar a senha do modo demonstração
 
 1. Escolha a nova senha e calcule o hash no console do navegador:
 
@@ -95,15 +147,17 @@ SHA-256 dela na constante `ACCESS_HASH`.
 2. Substitua o valor de `ACCESS_HASH` em `script.js` pelo hash impresso.
 3. Atualize a senha documentada aqui.
 
-> A verificação usa a Web Crypto API (`crypto.subtle`), disponível em contexto
-> seguro: `file://`, `localhost` ou `https`. Serve o projeto com
-> `python3 -m http.server 8000` e acesse `http://localhost:8000`.
+> A verificação da senha demo usa a Web Crypto API (`crypto.subtle`), disponível
+> em contexto seguro: `file://`, `localhost` ou `https`. Para credenciais reais,
+> use sempre o Supabase Auth — nunca uma senha fixa no código.
 
 ## Observações
 
-O protótipo original do Figma foi capturado apenas na tela inicial. Os botões de
-denúncia foram implementados como um modal de demonstração — não há envio real de
-dados. As denúncias ficam apenas no `localStorage` do navegador e a área restrita é
-uma **proteção demonstrativa**: como tudo roda no cliente, qualquer pessoa com
-acesso ao código pode burlar a senha. Em produção, a autenticação e o banco de
-dados precisam ficar no servidor, com senhas armazenadas usando bcrypt/Argon2.
+O protótipo original do Figma foi capturado apenas na tela inicial; os botões de
+denúncia viraram um modal funcional. Com o Supabase configurado, os dados trafegam
+entre o navegador e o banco com a chave anon, e o acesso à equipe é controlado pelo
+Supabase Auth + RLS. Sem configuração, tudo continua apenas no `localStorage` e a
+senha local é uma **proteção demonstrativa** (qualquer pessoa com acesso ao código
+pode burlá-la). Antes de publicar, confirme no painel do Supabase que:
+**Authentication → Providers → Email** está ativo, as políticas de RLS estão
+aplicadas e o domínio do site está liberado em **Authentication → URL Configuration**.

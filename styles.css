@@ -967,6 +967,26 @@ a {
   display: none;
 }
 
+.form__hint {
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.form__hint:empty,
+.form__hint[hidden] {
+  display: none;
+}
+
+.modal__panel--center .report__protocol:not([hidden]) {
+  display: block;
+  margin-bottom: 0.75rem;
+}
+
+.modal__panel--center .form__hint {
+  margin-bottom: 1rem;
+}
+
 .form__actions {
   display: flex;
   justify-content: flex-end;

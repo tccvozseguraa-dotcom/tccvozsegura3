@@ -3,12 +3,13 @@
    Pré-cache do "app shell", navegação network-first e
    assets estáticos cache-first.
    ============================================================ */
-const CACHE_NAME = "vozsegura-v1";
+const CACHE_NAME = "vozsegura-v2";
 
 const PRECACHE = [
   "./",
   "./index.html",
   "./styles.css",
+  "./supabase-config.js",
   "./script.js",
   "./manifest.webmanifest",
   "./icons/icon-192.png",
@@ -59,6 +60,25 @@ self.addEventListener("fetch", function (event) {
 
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
+
+  // Configuração do Supabase: sempre busca a versão mais recente na rede
+  // (com fallback em cache para funcionar offline).
+  if (url.pathname.endsWith("/supabase-config.js")) {
+    event.respondWith(
+      fetch(request)
+        .then(function (response) {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then(function (cache) {
+            cache.put(request, copy);
+          });
+          return response;
+        })
+        .catch(function () {
+          return caches.match(request);
+        })
+    );
+    return;
+  }
 
   // Navegação: tenta a rede e usa o index salvo como fallback offline.
   if (request.mode === "navigate") {

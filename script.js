@@ -1,7 +1,7 @@
 /* ============================================================
    Voz Segura — interações
    Menu mobile · rolagem suave · navegação ativa · modal de denúncia
-   · área restrita (senha) para consulta das denúncias
+   · Supabase: envio de denúncias, migração local e Auth da equipe
    ============================================================ */
 (function () {
   "use strict";
@@ -11,15 +11,36 @@
   const menuToggle = document.getElementById("menu-toggle");
 
   /* ----------------------------------------------------------
-     Configuração da área restrita
+     Configuração
      ---------------------------------------------------------- */
   const STORAGE_KEY = "vozsegura.denuncias";
   const AUTH_KEY = "vozsegura.autenticado";
 
   // Hash SHA-256 da senha padrão "vozsegura2024".
-  // Para trocar a senha, substitua este valor pelo hash da nova senha
-  // (veja o README). A senha em texto puro NÃO fica no código.
+  // Usado apenas no modo demonstração (sem Supabase configurado).
   const ACCESS_HASH = "574167af28916952c6bf65831e0cc6864c602458cfe23a343804fc31d7106d60";
+
+  const TIPOS_PERMITIDOS = [
+    "bullying escolar",
+    "cyberbullying",
+    "abuso sexual",
+    "violência psicológica",
+    "assédio",
+    "outro",
+  ];
+
+  const supabaseConfig = window.VOZSEGURA_SUPABASE || {};
+  const SUPABASE_CONFIGURED = Boolean(
+    supabaseConfig.url &&
+      supabaseConfig.anonKey &&
+      supabaseConfig.url.indexOf("http") === 0
+  );
+
+  let createClient = null;
+  let supabase = null;
+  let supabasePromise = null;
+  let usingSupabase = false;
+  let migrating = false;
 
   /* ----------------------------------------------------------
      Utilidades
@@ -31,6 +52,22 @@
     if (!target) return;
     const top = target.getBoundingClientRect().top + window.scrollY - headerOffset() + 1;
     window.scrollTo({ top, behavior: "smooth" });
+  }
+
+  function normalizeTipo(tipo) {
+    const value = String(tipo || "").trim().toLowerCase();
+    return TIPOS_PERMITIDOS.indexOf(value) > -1 ? value : "outro";
+  }
+
+  function isOfflineError(error) {
+    if (navigator.onLine === false) return true;
+    const message = String((error && error.message) || error || "").toLowerCase();
+    return (
+      message.indexOf("fetch") > -1 ||
+      message.indexOf("network") > -1 ||
+      message.indexOf("offline") > -1 ||
+      message.indexOf("load failed") > -1
+    );
   }
 
   /* ----------------------------------------------------------
@@ -131,7 +168,37 @@
   }
 
   /* ----------------------------------------------------------
-     Armazenamento local das denúncias
+     Supabase — cliente carregado sob demanda
+     ---------------------------------------------------------- */
+  function ensureSupabase() {
+    if (!SUPABASE_CONFIGURED) return Promise.resolve(null);
+    if (supabasePromise) return supabasePromise;
+
+    supabasePromise = import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm")
+      .then(function (module) {
+        createClient = module.createClient;
+        supabase = createClient(supabaseConfig.url, supabaseConfig.anonKey, {
+          auth: {
+            persistSession: true,
+            autoRefreshToken: true,
+            detectSessionInUrl: true,
+          },
+        });
+        usingSupabase = true;
+        return supabase;
+      })
+      .catch(function (error) {
+        console.warn("Supabase indisponível; usando armazenamento local:", error);
+        usingSupabase = false;
+        supabasePromise = null; // permite nova tentativa na próxima ação
+        return null;
+      });
+
+    return supabasePromise;
+  }
+
+  /* ----------------------------------------------------------
+     Armazenamento local (modo demonstração / fila de envio)
      ---------------------------------------------------------- */
   function loadReports() {
     try {
@@ -157,6 +224,95 @@
       .toUpperCase()
       .padStart(4, "0");
     return "VZ-" + stamp + "-" + random;
+  }
+
+  /* ----------------------------------------------------------
+     Banco de dados — inserção, consulta e exclusão
+     ---------------------------------------------------------- */
+  async function sendReport(report) {
+    const client = await ensureSupabase();
+    if (!client) return { ok: false, offline: true };
+
+    const payload = {
+      protocolo: report.id,
+      criado_em: report.data || new Date().toISOString(),
+      tipo: normalizeTipo(report.tipo),
+      descricao: report.descricao,
+      local: report.local || "",
+    };
+
+    try {
+      // INSERT anônimo: sem .select(), o PostgREST usa "return=minimal" e não
+      // exige o privilégio de leitura, que é negado ao papel anon por RLS.
+      const result = await client.from("denuncias").insert(payload);
+      if (!result.error) return { ok: true };
+      // Protocolo duplicado: a denúncia já tinha sido enviada (ex.: migração em outra aba).
+      if (result.error.code === "23505") return { ok: true };
+      return { ok: false, offline: isOfflineError(result.error), error: result.error };
+    } catch (error) {
+      return { ok: false, offline: true, error: error };
+    }
+  }
+
+  async function fetchReports() {
+    const client = await ensureSupabase();
+    if (!client) return loadReports();
+
+    const result = await client
+      .from("denuncias")
+      .select("protocolo, criado_em, tipo, descricao, local")
+      .order("criado_em", { ascending: false });
+
+    if (result.error) throw result.error;
+
+    return (result.data || []).map(function (row) {
+      return {
+        id: row.protocolo,
+        data: row.criado_em,
+        tipo: row.tipo,
+        descricao: row.descricao,
+        local: row.local,
+      };
+    });
+  }
+
+  async function deleteReport(report) {
+    if (!supabase || !usingSupabase) return false;
+    const result = await supabase
+      .from("denuncias")
+      .delete()
+      .eq("protocolo", report.id);
+    return !result.error;
+  }
+
+  // Envia para o banco as denúncias antigas do localStorage.
+  // Só remove do dispositivo aquelas que foram gravadas com sucesso.
+  async function migrateLocalReports() {
+    const client = await ensureSupabase();
+    if (!client || migrating) return;
+
+    migrating = true;
+    try {
+      const reports = loadReports();
+      if (!reports.length) return;
+
+      const enviadas = [];
+      for (let i = 0; i < reports.length; i += 1) {
+        const result = await sendReport(reports[i]);
+        if (result.ok) enviadas.push(reports[i].id);
+      }
+      if (enviadas.length) {
+        // Relê a fila para não apagar denúncias adicionadas durante a migração.
+        const atual = loadReports();
+        saveReports(
+          atual.filter(function (report) {
+            return enviadas.indexOf(report.id) === -1;
+          })
+        );
+      }
+    } finally {
+      migrating = false;
+    }
   }
 
   /* ----------------------------------------------------------
@@ -240,6 +396,8 @@
   const reportModal = document.getElementById("report-modal");
   const reportForm = document.getElementById("report-form");
   const reportError = document.getElementById("report-error");
+  const reportProtocol = document.getElementById("report-protocol");
+  const reportSuccessNote = document.getElementById("report-success-note");
   const formView = reportModal && reportModal.querySelector('[data-report-view="form"]');
   const successView = reportModal && reportModal.querySelector('[data-report-view="success"]');
 
@@ -251,6 +409,8 @@
   function openReportModal() {
     showReportView("form");
     if (reportError) reportError.hidden = true;
+    if (reportProtocol) reportProtocol.hidden = true;
+    if (reportSuccessNote) reportSuccessNote.hidden = true;
     if (reportForm) reportForm.reset();
     openModal(reportModal);
   }
@@ -263,7 +423,7 @@
   });
 
   if (reportForm) {
-    reportForm.addEventListener("submit", function (event) {
+    reportForm.addEventListener("submit", async function (event) {
       event.preventDefault();
 
       const type = reportForm.querySelector("#report-type");
@@ -272,24 +432,57 @@
       const valid = type.value !== "" && description.value.trim().length > 0;
 
       if (!valid) {
-        if (reportError) reportError.hidden = false;
+        if (reportError) {
+          reportError.textContent = "Preencha o tipo e a descrição para enviar.";
+          reportError.hidden = false;
+        }
         (type.value === "" ? type : description).focus();
         return;
       }
 
       if (reportError) reportError.hidden = true;
 
-      // Protótipo: aqui entraria a chamada real ao backend.
-      // No protótipo, a denúncia fica salva neste navegador.
-      const reports = loadReports();
-      reports.unshift({
+      const submitButton = reportForm.querySelector('button[type="submit"]');
+      if (submitButton) submitButton.disabled = true;
+
+      const report = {
         id: makeProtocol(),
         data: new Date().toISOString(),
         tipo: type.value,
         descricao: description.value.trim(),
         local: place && place.value.trim() ? place.value.trim() : "",
-      });
-      saveReports(reports);
+      };
+
+      const result = await sendReport(report);
+      if (submitButton) submitButton.disabled = false;
+
+      let note = "";
+      if (!result.ok) {
+        if (result.offline) {
+          // Sem rede: guarda no dispositivo e sincroniza quando a conexão voltar.
+          const reports = loadReports();
+          reports.unshift(report);
+          saveReports(reports);
+          note =
+            "Sem conexão com o banco: sua denúncia ficou salva neste dispositivo e será enviada automaticamente.";
+        } else {
+          if (reportError) {
+            reportError.textContent =
+              "Não foi possível enviar sua denúncia. Tente novamente em instantes.";
+            reportError.hidden = false;
+          }
+          return;
+        }
+      }
+
+      if (reportProtocol) {
+        reportProtocol.textContent = "Protocolo: " + report.id;
+        reportProtocol.hidden = false;
+      }
+      if (reportSuccessNote) {
+        reportSuccessNote.textContent = note;
+        reportSuccessNote.hidden = !note;
+      }
 
       reportForm.reset();
       showReportView("success");
@@ -299,7 +492,7 @@
   }
 
   /* ----------------------------------------------------------
-     6. Área restrita — senha e consulta das denúncias
+     6. Área restrita — Auth do Supabase (ou senha no modo demo)
      ---------------------------------------------------------- */
   const accessModal = document.getElementById("access-modal");
   const accessForm = document.getElementById("access-form");
@@ -340,20 +533,52 @@
     return date.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
   }
 
-  function renderReports() {
+  function showAccessError(message) {
+    if (!accessError) return;
+    accessError.textContent = message;
+    accessError.hidden = false;
+  }
+
+  async function renderReports() {
     const listEl = document.getElementById("reports-list");
     const countEl = document.getElementById("reports-count");
+    const errorEl = document.getElementById("reports-error");
     if (!listEl) return;
 
-    const reports = loadReports();
+    if (errorEl) errorEl.hidden = true;
+
+    let reports = [];
+    let remote = false;
+
+    try {
+      if (usingSupabase) {
+        reports = await fetchReports();
+        remote = true;
+      } else {
+        reports = loadReports();
+      }
+    } catch (error) {
+      if (errorEl) {
+        errorEl.textContent =
+          "Não foi possível carregar as denúncias: " + ((error && error.message) || "erro desconhecido");
+        errorEl.hidden = false;
+      }
+    }
 
     if (countEl) {
       countEl.textContent =
         reports.length === 0
-          ? "Nenhuma denúncia registrada neste navegador."
+          ? remote
+            ? "Nenhuma denúncia registrada no banco."
+            : "Nenhuma denúncia registrada neste navegador."
           : reports.length === 1
-          ? "1 denúncia registrada neste navegador."
-          : reports.length + " denúncias registradas neste navegador.";
+          ? remote
+            ? "1 denúncia registrada no banco."
+            : "1 denúncia registrada neste navegador."
+          : reports.length +
+            (remote
+              ? " denúncias registradas no banco."
+              : " denúncias registradas neste navegador.");
     }
 
     listEl.textContent = "";
@@ -361,12 +586,14 @@
     if (!reports.length) {
       const empty = document.createElement("p");
       empty.className = "reports__empty";
-      empty.textContent = "As denúncias enviadas aparecerão aqui.";
+      empty.textContent = remote
+        ? "Ainda não há denúncias registradas."
+        : "As denúncias enviadas aparecerão aqui.";
       listEl.appendChild(empty);
       return;
     }
 
-    reports.forEach(function (report, index) {
+    reports.forEach(function (report) {
       const card = document.createElement("article");
       card.className = "report";
 
@@ -407,10 +634,30 @@
       remove.className = "report__delete";
       remove.type = "button";
       remove.textContent = "Excluir denúncia";
-      remove.addEventListener("click", function () {
-        const current = loadReports();
-        current.splice(index, 1);
-        saveReports(current);
+      remove.addEventListener("click", async function () {
+        remove.disabled = true;
+
+        if (remote) {
+          const ok = await deleteReport(report);
+          if (!ok) {
+            remove.disabled = false;
+            if (errorEl) {
+              errorEl.textContent = "Não foi possível excluir a denúncia.";
+              errorEl.hidden = false;
+            }
+            return;
+          }
+        } else {
+          const current = loadReports();
+          const index = current.findIndex(function (item) {
+            return item.id === report.id;
+          });
+          if (index > -1) {
+            current.splice(index, 1);
+            saveReports(current);
+          }
+        }
+
         renderReports();
       });
       card.appendChild(remove);
@@ -424,13 +671,25 @@
     if (listView) listView.hidden = view !== "list";
   }
 
-  function openAccessModal() {
+  async function hasSession() {
+    const client = await ensureSupabase();
+    if (!client) return isAuthenticated();
+    try {
+      const result = await client.auth.getSession();
+      return Boolean(result.data && result.data.session);
+    } catch (error) {
+      return isAuthenticated();
+    }
+  }
+
+  async function openAccessModal() {
     closeMenu();
     if (!accessModal) return;
     if (accessError) accessError.hidden = true;
     if (accessForm) accessForm.reset();
 
-    if (isAuthenticated()) {
+    const loggedIn = await hasSession();
+    if (loggedIn) {
       renderReports();
       showAccessView("list");
     } else {
@@ -448,26 +707,49 @@
     accessForm.addEventListener("submit", async function (event) {
       event.preventDefault();
 
+      const emailInput = accessForm.querySelector("#access-email");
       const passwordInput = accessForm.querySelector("#access-password");
       const submitButton = accessForm.querySelector('button[type="submit"]');
       if (submitButton) submitButton.disabled = true;
+      if (accessError) accessError.hidden = true;
 
       let unlocked = false;
-      try {
-        unlocked = (await sha256(passwordInput.value)) === ACCESS_HASH;
-      } catch (error) {
-        unlocked = false;
+
+      if (usingSupabase) {
+        if (!emailInput || !emailInput.value.trim()) {
+          showAccessError("Informe o e-mail da equipe.");
+          if (emailInput) emailInput.focus();
+          if (submitButton) submitButton.disabled = false;
+          return;
+        }
+        try {
+          const result = await supabase.auth.signInWithPassword({
+            email: emailInput.value.trim(),
+            password: passwordInput.value,
+          });
+          unlocked = !result.error;
+          if (!unlocked) {
+            showAccessError("E-mail ou senha incorretos. Tente novamente.");
+          }
+        } catch (error) {
+          showAccessError("Não foi possível entrar. Verifique sua conexão.");
+        }
+      } else {
+        try {
+          unlocked = (await sha256(passwordInput.value)) === ACCESS_HASH;
+        } catch (error) {
+          unlocked = false;
+        }
+        if (!unlocked) showAccessError("Senha incorreta. Tente novamente.");
       }
 
       if (submitButton) submitButton.disabled = false;
 
       if (!unlocked) {
-        if (accessError) accessError.hidden = false;
         passwordInput.focus();
         return;
       }
 
-      if (accessError) accessError.hidden = true;
       setAuthenticated(true);
       renderReports();
       showAccessView("list");
@@ -477,14 +759,51 @@
   }
 
   document.querySelectorAll("[data-logout]").forEach(function (button) {
-    button.addEventListener("click", function () {
+    button.addEventListener("click", async function () {
       setAuthenticated(false);
       if (accessForm) accessForm.reset();
+      if (accessError) accessError.hidden = true;
       showAccessView("login");
+
+      if (supabase && usingSupabase) {
+        try {
+          await supabase.auth.signOut();
+        } catch (error) {
+          console.warn("Não foi possível encerrar a sessão:", error);
+        }
+      }
+
       const passwordInput = document.getElementById("access-password");
       if (passwordInput) passwordInput.focus();
     });
   });
+
+  // Ajusta o formulário de acesso e dispara a migração das denúncias locais.
+  function applyAccessMode() {
+    const emailField = document.getElementById("access-email-field");
+    const note = document.getElementById("access-mode-note");
+
+    ensureSupabase().then(function (client) {
+      if (client) {
+        if (emailField) emailField.hidden = false;
+        if (note) {
+          note.textContent =
+            "Entre com a conta da equipe cadastrada no Supabase Auth. As denúncias são lidas diretamente do banco.";
+        }
+        migrateLocalReports();
+        return;
+      }
+
+      if (emailField) emailField.hidden = true;
+      if (note) {
+        note.textContent = SUPABASE_CONFIGURED
+          ? "Banco indisponível no momento. Usando o modo demonstração neste navegador."
+          : "Modo demonstração: as denúncias ficam salvas neste navegador.";
+      }
+    });
+  }
+
+  applyAccessMode();
 
   /* ----------------------------------------------------------
      7. PWA — instalação, modo offline e service worker
@@ -519,7 +838,10 @@
     if (offlineBadge) offlineBadge.hidden = navigator.onLine !== false;
   }
 
-  window.addEventListener("online", updateOnlineStatus);
+  window.addEventListener("online", function () {
+    updateOnlineStatus();
+    migrateLocalReports();
+  });
   window.addEventListener("offline", updateOnlineStatus);
   updateOnlineStatus();
 

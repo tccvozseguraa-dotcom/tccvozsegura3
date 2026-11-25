@@ -635,6 +635,8 @@
             Sua denúncia foi registrada com segurança e sigilo. Nossa equipe vai analisar o caso.
             Se você estiver em risco imediato, ligue <strong>100</strong> ou <strong>180</strong>.
           </p>
+          <p class="report__protocol" id="report-protocol" hidden></p>
+          <p class="form__hint" id="report-success-note" hidden></p>
           <button class="btn btn--primary" type="button" data-close-modal>Entendi</button>
         </div>
       </div>
@@ -663,11 +665,23 @@
           </div>
           <h2 class="modal__title" id="access-title">Área da Equipe</h2>
           <p class="modal__text">
-            Esta área é exclusiva de profissionais autorizados. Informe a senha para consultar
-            as denúncias registradas.
+            Esta área é exclusiva de profissionais autorizados. Informe seus dados para
+            consultar as denúncias registradas.
           </p>
 
           <form class="form" id="access-form" novalidate>
+            <div class="form__field" id="access-email-field" hidden>
+              <label for="access-email">E-mail da equipe</label>
+              <input
+                id="access-email"
+                name="email"
+                type="email"
+                autocomplete="username"
+                placeholder="voce@exemplo.com"
+                required
+              />
+            </div>
+
             <div class="form__field">
               <label for="access-password">Senha de acesso</label>
               <input
@@ -680,9 +694,8 @@
               />
             </div>
 
-            <p class="form__error" id="access-error" hidden>
-              Senha incorreta. Tente novamente.
-            </p>
+            <p class="form__hint" id="access-mode-note"></p>
+            <p class="form__error" id="access-error" hidden></p>
 
             <div class="form__actions">
               <button class="btn btn--ghost" type="button" data-close-access>Cancelar</button>
@@ -700,6 +713,7 @@
             <button class="btn btn--ghost btn--sm" type="button" data-logout>Sair</button>
           </div>
 
+          <p class="form__error" id="reports-error" hidden></p>
           <div class="reports" id="reports-list"></div>
 
           <div class="form__actions">
@@ -709,6 +723,7 @@
       </div>
     </div>
 
+    <script src="supabase-config.js"></script>
     <script src="script.js"></script>
   </body>
 </html>
